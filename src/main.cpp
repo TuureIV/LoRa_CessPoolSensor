@@ -20,6 +20,9 @@
 #define ADC_READ_STABILIZE      5       // in ms (delay from GPIO control and ADC connections times)
 #define LO_BATT_SLEEP_TIME      10*60*1000*1000     // How long when low batt to stay in sleep (us)
 #define VBATT_GPIO              21      // Heltec GPIO to toggle VBatt read connection ... WARNING!!! This also connects VEXT to VCC=3.3v so be careful what is on header.  Also, take care NOT to have ADC read connection in OPEN DRAIN when GPIO goes HIGH
+#define SUCCESFUL_UPDATE        "DB UPDATE SUCCESFUL"
+#define SLEEP_HOURS             0.016 //minute is 0.016
+#define HOURS_TO_uS             36E8 //Sleep time must be set in microseconds
 
 uint16_t Sample();
 void DrawBattery(uint16_t, bool = false); 
@@ -29,30 +32,41 @@ uint16_t v;
 double pct = 100;
 
 
+
 /*MESSAGE STUFF*/
 String outgoing;              // outgoing message
 byte localAddress = 0x01;     // address of this device
 byte destination = 0x00;      // destination to send to
-byte msgCount = 0;            // count of outgoing messages
+RTC_DATA_ATTR byte msgCount = 0;            // count of outgoing messages and wakeups
 long lastSendTime = 0;        // last send time
-int interval = 5000;          // interval between sends
+//int interval = 5000;          // interval between sends
+
+byte sender;
+int incomingMsgId = 0;
+String incomingMsg ="";
+
 esp_adc_cal_characteristics_t *adc_chars;
 
 /*Depth stuff*/
 int depth = 0;
-int sampleAmount = 30;
+int depthSamples = 10;
 
 int GetDepth();
 void SendMessage(String outgoing);
+void OnReceive(int packetSize);
 uint16_t ReadVBatt();
 uint16_t Sample();
 uint8_t GetPrecentage();
 void drawBattery(uint16_t voltage, bool sleep);
 void PrintToOled(String ms1,String ms4, String ms2, String ms3);
 
+//debugging
+
 void setup()
 {
-  Heltec.begin(true /*DisplayEnable Enable*/, true /*Heltec.LoRa Disable*/, true /*Serial Enable*/, false /*PABOOST Enable*/, BAND /*long BAND*/);
+  Heltec.begin(true /*DisplayEnable Enable*/, true /*Heltec.LoRa Disable*/, true /*Serial Enable*/, true /*PABOOST Enable*/, BAND /*long BAND*/);
+
+  esp_sleep_enable_timer_wakeup(SLEEP_HOURS * HOURS_TO_uS);
 
   /*Battery measuring setup*/
   adc_chars = (esp_adc_cal_characteristics_t*)calloc(1, sizeof(esp_adc_cal_characteristics_t));
@@ -70,23 +84,31 @@ void setup()
 
   pinMode(trigPin, OUTPUT); // Sets the trigPin as an OUTPUT
   pinMode(echoPin, INPUT); // Sets the echoPin as an INPUT
+
+  msgCount ++;
 }
 
 void loop()
 { 
+
   voltage = Sample();
   
-  if (millis() - lastSendTime > interval){
+  if (true){ //millis() - lastSendTime > interval
   
-    //depth = GetDepth();
-    depth = random(200);
+    depth = GetDepth();
     Heltec.display->clear();
     PrintToOled("DEPTH: ",  String(depth) + "cm", "V: " + String(round(voltage/10.0)/100.0) +"v", "BAT: "+ String((int)round(pct))+"%");
     String message = ":"+ String(depth) + ":"+ String((round(voltage/10.0)/100.0)) + ":" +String((int)round(pct));   // send a message
     
     Serial.println("Sending->" + message);
     SendMessage(message);
-    lastSendTime = millis();            // timestamp the message
+    LoRa.onReceive(OnReceive);
+    LoRa.receive();
+    delay(20);
+    LoRa.onReceive(OnReceive);
+
+
+    //lastSendTime = millis();            // timestamp the message
 
     if (v < MINBATT) {                  // Low Voltage cut off shut down to protect battery as long as possible
       Heltec.display->setColor(WHITE);
@@ -94,10 +116,35 @@ void loop()
       Heltec.display->setTextAlignment(TEXT_ALIGN_CENTER);
       Heltec.display->drawString(64,24,"Shutdown!!");
       Heltec.display->display();
-      delay(2000);     
+      message = "SHUTDOWN, BATTERY LOW!";
+      SendMessage(message);
+      delay(2000);
+      esp_sleep_enable_timer_wakeup(5000 * HOURS_TO_uS);
     }
   }
+  delay(5000);
+
+  if (incomingMsg == SUCCESFUL_UPDATE)
+  {
+    PrintToOled("Sleep for", String(SLEEP_HOURS) +"h","", "");
+    delay(2000);
+    Heltec.display->displayOff();
+    esp_deep_sleep_start();
+  }
+  else
+  {
+    PrintToOled("DB Update", "failed","", "");
+    esp_sleep_enable_timer_wakeup(0.02 * HOURS_TO_uS);
+    delay(2000);
+    Heltec.display->displayOff();
+    esp_deep_sleep_start();
+    
+  }
+    
 }
+
+
+//Functions
 
 void PrintToOled(String ms1,String ms4, String ms2, String ms3) { // PrintToOled("","","","","");
   Heltec.display->clear();
@@ -166,24 +213,25 @@ uint16_t ReadVBatt() {
 }
 
 int GetDepth() {
-  int measured_distance = 0;
-  int samples = 0;
-  for (size_t i = 0; i < sampleAmount; i++)
+  int calculated_distance = 0;
+  int avarage = 0;
+  for (size_t i = 0; i < depthSamples; i++)
   {
      // Clears the trigPin condition
-    digitalWrite(trigPin, LOW);
-    delayMicroseconds(2);
-    // Sets the trigPin HIGH (ACTIVE) for 10 microseconds
-    digitalWrite(trigPin, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trigPin, LOW);
-    // Reads the echoPin, returns the sound wave travel time in microseconds
-    duration = pulseIn(echoPin, HIGH);
-    // Calculating the distance
-    measured_distance = duration * 0.034 / 2; // Speed of sound wave divided by 2 (go and back)
-    samples += measured_distance;
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  // Sets the trigPin HIGH (ACTIVE) for 10 microseconds
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  duration = pulseIn(echoPin, HIGH);
+  // Calculating the distance
+  calculated_distance = duration * 0.034 / 2; // Speed of sound wave divided by 2 (go and back)
+  avarage += calculated_distance;
   }
-  return measured_distance ; //= samples/30
+  calculated_distance = avarage/depthSamples;
+  return calculated_distance;
 }
 
 void SendMessage(String outgoing){
@@ -195,4 +243,40 @@ void SendMessage(String outgoing){
   LoRa.print(outgoing);                 // add payload
   LoRa.endPacket();                     // finish packet and send it
   msgCount++;                           // increment message ID
+}
+
+void OnReceive(int packetSize)
+{
+  if (packetSize == 0) return;          // if there's no packet, return
+
+  // read packet header bytes:
+  int recipient = LoRa.read();          // recipient address
+  sender = LoRa.read();            // sender address
+  incomingMsgId = LoRa.read();     // incoming msg ID
+  byte incomingLength = LoRa.read();    // incoming msg length
+  incomingMsg = "";
+  while (LoRa.available())             // can't use readString() in callback
+  {
+    incomingMsg += (char)LoRa.read();      // add bytes one by one
+  }
+
+  if (incomingLength != incomingMsg.length())   // check length for error
+  {
+    Serial.println("error: message length does not match length");
+    return;                             // skip rest of function
+  }
+
+  // if the recipient isn't this device or broadcast,
+  if (recipient != localAddress && recipient != 0xFF)
+  {
+    Serial.println("This message is not for me.");
+    return;                             // skip rest of function
+  }
+  // if message is for this device, or broadcast, print details:
+  Serial.println("Received from: 0x" + String(sender, HEX));
+  Serial.println("Sent to: 0x" + String(recipient, HEX));
+  Serial.println("Message ID: " + String(incomingMsgId));
+  Serial.println("Message length: " + String(incomingLength));
+  Serial.println("Message: " + incomingMsg);
+  Serial.println("RSSI: " + String(LoRa.packetRssi()));
 }
